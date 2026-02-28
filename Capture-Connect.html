@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SENTRY-TRACE | Geospatial Engine</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <style>
+        :root {
+            --neon-green: #0f0;
+            --dark-bg: #000;
+            --terminal-gray: #1a1a1a;
+            --accent-blue: #2563eb;
+            --error-red: #ff4444;
+        }
+
+        body, html {
+            margin: 0; padding: 0;
+            background: var(--dark-bg);
+            color: var(--neon-green);
+            font-family: 'Courier New', Courier, monospace;
+            height: 100vh; overflow: hidden;
+            display: flex; flex-direction: column;
+        }
+
+        /* UI/UX Layout - 80% Map / 20% Controls & Console */
+        #map {
+            height: 75vh;
+            width: 100%;
+            background: #050505;
+            /* Dark Mode Filter for OSM Tiles */
+            filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(90%);
+        }
+
+        #dashboard {
+            height: 25vh;
+            background: var(--terminal-gray);
+            border-top: 2px solid var(--neon-green);
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            padding: 10px;
+            gap: 10px;
+            box-sizing: border-box;
+        }
+
+        .controls {
+            display: flex; flex-direction: column; gap: 8px;
+        }
+
+        .stats {
+            font-size: 0.8rem;
+            border-left: 1px solid var(--neon-green);
+            padding-left: 10px;
+            overflow-y: auto;
+        }
+
+        .terminal-log {
+            grid-column: span 2;
+            background: #050505;
+            font-size: 0.7rem;
+            padding: 5px;
+            height: 60px;
+            overflow-y: scroll;
+            border: 1px solid #333;
+        }
+
+        button {
+            background: transparent;
+            color: var(--neon-green);
+            border: 1px solid var(--neon-green);
+            padding: 8px;
+            cursor: pointer;
+            text-transform: uppercase;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+
+        button:hover { background: var(--neon-green); color: #000; }
+        button:disabled { border-color: #333; color: #333; }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 2px 5px;
+            background: #222;
+            border: 1px solid var(--neon-green);
+        }
+
+        input[type="file"] { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div id="dashboard">
+        <div class="controls">
+            <div>STATUS: <span id="status" class="status-badge">IDLE</span> | ROWS: <span id="count">0</span></div>
+            <div style="display: flex; gap: 5px;">
+                <button id="startBtn">Start Log</button>
+                <button id="stopBtn" disabled>Stop & Export</button>
+                <button onclick="document.getElementById('importFile').click()">Import JSON</button>
+            </div>
+            <input type="file" id="importFile" accept=".json">
+        </div>
+
+        <div class="stats" id="liveStats">
+            LAT: 0.0000<br>LNG: 0.0000<br>ACC: -- m<br>ALT: -- m
+        </div>
+
+        <div class="terminal-log" id="console">
+            [SYSTEM] Initialization Complete... Ready for command.
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script>
+        // --- CONFIGURATION & GLOBALS ---
+        let map, polyline, liveData = [];
+        let currentPos = null;
+        let loggingInterval = null;
+        let isLogging = false;
+
+        const logConsole = document.getElementById('console');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        // --- INITIALIZATION ---
+        function initMap() {
+            map = L.map('map').setView([0, 0], 2);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap'
+            }).addTo(map);
+
+            polyline = L.polyline([], {
+                color: '#0f0', // Neon Green for live
+                weight: 3,
+                opacity: 0.8,
+                className: 'neon-trace'
+            }).addTo(map);
+        }
+
+        function writeLog(msg) {
+            const entry = document.createElement('div');
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logConsole.prepend(entry);
+        }
+
+        // --- CAPTURE LOGIC (HARDWARE) ---
+        if ("geolocation" in navigator) {
+            navigator.geolocation.watchPosition(
+                (pos) => {
+                    currentPos = pos.coords;
+                    updateStatsUI(pos.coords);
+                },
+                (err) => writeLog(`ERROR: ${err.message}`),
+                { enableHighAccuracy: true, maximumAge: 0 }
+            );
+        }
+
+        function updateStatsUI(coords) {
+            document.getElementById('liveStats').innerHTML = `
+                LAT: ${coords.latitude.toFixed(6)}<br>
+                LNG: ${coords.longitude.toFixed(6)}<br>
+                ACC: ${coords.accuracy.toFixed(1)} m<br>
+                ALT: ${coords.altitude ? coords.altitude.toFixed(1) : '0'} m
+            `;
+        }
+
+        // --- HIGH-FREQUENCY LOGGING (1ms Polling) ---
+        startBtn.onclick = () => {
+            if (!currentPos) return alert("Waiting for GPS lock...");
+            isLogging = true;
+            liveData = [];
+            polyline.setLatLngs([]);
+            
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            document.getElementById('status').innerText = "LOGGING";
+            document.getElementById('status').style.color = "red";
+
+            writeLog("Started 1ms background polling...");
+
+            loggingInterval = setInterval(() => {
+                if (currentPos) {
+                    const now = new Date();
+                    liveData.push({
+                        timestamp_ms: now.getTime(),
+                        iso_8601: now.toISOString(),
+                        lat: currentPos.latitude,
+                        lng: currentPos.longitude,
+                        acc: currentPos.accuracy,
+                        alt: currentPos.altitude || 0
+                    });
+                }
+            }, 1);
+
+            // Throttle Map UI update to 100ms for performance
+            uiInterval = setInterval(() => {
+                if (currentPos) {
+                    const newLatLng = [currentPos.latitude, currentPos.longitude];
+                    polyline.addLatLng(newLatLng);
+                    map.panTo(newLatLng);
+                    document.getElementById('count').innerText = liveData.length;
+                }
+            }, 100);
+        };
+
+        stopBtn.onclick = () => {
+            clearInterval(loggingInterval);
+            clearInterval(uiInterval);
+            isLogging = false;
+            
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            document.getElementById('status').innerText = "IDLE";
+            document.getElementById('status').style.color = "var(--neon-green)";
+
+            exportCSV();
+        };
+
+        // --- DATA EXPORT (CSV) ---
+        function exportCSV() {
+            writeLog(`Generating CSV for ${liveData.length} rows...`);
+            const headers = "timestamp_ms,iso_8601,latitude,longitude,accuracy_m,altitude_m\n";
+            const csvRows = liveData.map(d => 
+                `${d.timestamp_ms},${d.iso_8601},${d.lat},${d.lng},${d.acc},${d.alt}`
+            ).join("\n");
+
+            const blob = new Blob([headers + csvRows], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `GPS_LOG_${Date.now()}.csv`;
+            a.click();
+            writeLog("Export successful.");
+        }
+
+        // --- IMPORT LOGIC (JSON to Shape) ---
+        document.getElementById('importFile').onchange = function(e) {
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                try {
+                    let data = JSON.parse(event.target.result);
+                    let coords = [];
+
+                    // Handle GeoJSON or Array format
+                    if (data.type === "Feature" && data.geometry.type === "LineString") {
+                        coords = data.geometry.coordinates.map(c => [c[1], c[0]]);
+                    } else if (Array.isArray(data)) {
+                        coords = data.map(p => [p.lat || p.latitude, p.lng || p.longitude]);
+                    }
+
+                    if (coords.length > 0) {
+                        // Logic: Append first to last for "Closed Loop"
+                        coords.push(coords[0]);
+                        
+                        // Style imported shape as blue
+                        const importPoly = L.polyline(coords, {
+                            color: '#2563eb',
+                            weight: 4,
+                            opacity: 0.7
+                        }).addTo(map);
+
+                        map.fitBounds(importPoly.getBounds());
+                        writeLog(`Imported shape with ${coords.length} points.`);
+                    }
+                } catch (err) {
+                    alert("Malformed JSON file.");
+                    writeLog("ERROR: Import failed.");
+                }
+            };
+            reader.readAsText(e.target.files[0]);
+        };
+
+        window.onload = initMap;
+    </script>
+</body>
+</html>
